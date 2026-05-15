@@ -1,0 +1,57 @@
+antenna:
+  bs_n_antennas: 32
+  ue_n_antennas: 8
+  bs_antenna_array: [4, 4, 2]
+  ue_antenna_array: [2, 2, 2]
+  antenna_element_pattern: '38.901'
+  polarization: cross
+resource:
+  carrier_frequency_ghz: 3.5
+  scs_khz: 15
+  n_prbs: 12
+  pdsch_start_symbol: 1
+  pdsch_n_symbols: 4
+  reserve_dmrs_re: false
+channel:
+  model: CDL
+  cdl_type: A
+  delay_spread_ns: 300.0
+  ue_speed_kmh: 3.0
+  normalize: true
+  direction: downlink
+  num_time_samples: 4
+receiver:
+  detector: soft_demapper_ldpc
+  max_ldpc_iterations: 20
+mapping:
+  scheme: flexible_cw
+  scheme_id: 7
+  rank: 5
+  params:
+    partition: [2, 2, 1]
+simulation:
+  snr_range_db: [0, 12, 2]
+  n_trials_per_snr: 50
+  batch_size: 10
+  seed: 7
+  output_dir: ./results_v27_scheme7_partition_debug
+  fixed_mcs: null
+  mcs_table: nr_256qam
+  backend: sionna_ldpc_bit_level
+adaptive_mcs:
+  enabled: true
+  decision_granularity: per_trial
+  method: capacity_average
+  shannon_gap_db: 2.5
+  mcs_margin_db: 1.0
+  min_mcs: 3
+  max_mcs: 24
+  min_code_rate: 0.2
+  scheme2_min_code_rate: 0.2
+  scheme2_allowed_qm: [2, 4, 6, 8]
+comparison:
+  enabled: false
+debug:
+  verbose: true
+  save_per_snr_json: true
+  log_per_cw: true

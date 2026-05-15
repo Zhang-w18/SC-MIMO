@@ -1,0 +1,25 @@
+# Scheme 7 selected partitions for tools/run_multi_rank.py
+# If a rank appears here, Scheme 7 will NOT enumerate all partitions for that rank.
+# It will run only the partitions listed below.
+
+rank_partitions:
+  2:
+    - [1, 1]
+  4:
+    - [2, 2]
+    - [3, 1]
+    - [2, 1, 1]
+  8:
+    - [2, 2, 2, 2]
+    - [3, 3, 2]
+    - [4, 2, 1, 1]
+  12:
+    - [6, 6]
+    - [4, 4, 4]
+    - [4, 4, 2, 2]
+    - [6, 4, 2]
+  16:
+    - [8, 8]
+    - [4, 4, 4, 4]
+    - [6, 6, 4]
+    - [8, 4, 2, 1, 1]

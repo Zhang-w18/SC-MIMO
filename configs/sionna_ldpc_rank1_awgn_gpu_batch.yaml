@@ -1,0 +1,44 @@
+# Sionna LDPC bit-level v2.2 GPU batch 示例配置
+# rank=1、single CW、fixed MCS、AWGN。
+# batch_size 越大，GPU 利用率通常越高；显存不足时可调小到 128/256。
+
+antenna:
+  bs_n_antennas: 1
+  ue_n_antennas: 1
+
+resource:
+  n_prbs: 6
+  pdsch_n_symbols: 4
+  reserve_dmrs_re: false
+
+channel:
+  model: "AWGN"
+  n_re_samples: 1
+
+mapping:
+  scheme: "flexible_cw"
+  scheme_id: 1
+  rank: 1
+
+simulation:
+  backend: "sionna_ldpc_bit_level"
+  mcs_table: "nr_64qam"
+  fixed_mcs: 3
+  snr_range_db: [-8, 4, 1]
+  n_trials_per_snr: 10000
+  batch_size: 1024
+  seed: 7
+  output_dir: "./results_sionna_ldpc_gpu_batch"
+
+comparison:
+  enabled: false
+
+receiver:
+  detector: "soft_demapper_ldpc"
+  sic_enabled: false
+  max_ldpc_iterations: 20
+
+debug:
+  verbose: true
+  save_per_snr_json: true
+  log_per_cw: true

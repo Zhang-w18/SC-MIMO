@@ -1,0 +1,38 @@
+# 快速冒烟测试配置：几十秒内验证流程
+antenna:
+  bs_n_antennas: 16
+  ue_n_antennas: 4
+
+resource:
+  n_prbs: 24
+  pdsch_n_symbols: 12
+  reserve_dmrs_re: false
+
+channel:
+  n_re_samples: 4
+  normalize: true
+
+mapping:
+  rank: 4
+
+simulation:
+  backend: "link_abstraction"
+  snr_range_db: [0, 20, 20]
+  n_trials_per_snr: 40
+  batch_size: 20
+  seed: 1
+  output_dir: "./results_quick"
+  fixed_mcs: null
+  shannon_gap_db: 2.5
+
+comparison:
+  enabled: true
+  schemes:
+    - {scheme_id: 1}
+    - {scheme_id: 2}
+    - {scheme_id: 4}
+    - {scheme_id: 6}
+    - {scheme_id: 7}
+
+debug:
+  verbose: true

@@ -1,0 +1,82 @@
+antenna:
+  bs_n_antennas: 128
+  ue_n_antennas: 16
+  bs_antenna_array: [8, 8, 2]
+  ue_antenna_array: [4, 2, 2]
+  antenna_element_pattern: '38.901'
+  polarization: cross
+
+resource:
+  carrier_frequency_ghz: 7.0
+  scs_khz: 30
+  n_prbs: 6
+  pdsch_start_symbol: 1
+  pdsch_n_symbols: 4
+  reserve_dmrs_re: false
+
+channel:
+  model: CDL
+  cdl_type: A
+  delay_spread_ns: 300.0
+  ue_speed_kmh: 3.0
+  normalize: true
+  direction: downlink
+  num_time_samples: 4
+
+receiver:
+  detector: soft_demapper_ldpc
+  max_ldpc_iterations: 20
+
+# v3.0 RX channel-estimation abstraction. Disabled in the base config to keep
+# v2.9-compatible behavior. Use the *_rxce_base.yaml config to enable it.
+channel_estimation:
+  enabled: false
+  mode: ideal
+  error_model: nmse
+  nmse_db: -25.0
+  equalizer: mmse
+  use_actual_rx_post_sinr_for_decoding: true
+  apply_to_mcs_selection: false
+  seed_base: 93001
+
+mapping:
+  scheme: flexible_cw
+  rank: 8
+
+simulation:
+  snr_range_db: [0, 20, 4]
+  n_trials_per_snr: 1000
+  batch_size: 32
+  seed: 7
+  output_dir: ./results_v28_7ghz_128t16r_cdl_adaptive
+  fixed_mcs: null
+  mcs_table: nr_256qam
+  backend: sionna_ldpc_bit_level
+
+adaptive_mcs:
+  enabled: true
+  decision_granularity: per_trial
+  method: capacity_average
+  shannon_gap_db: 2.5
+  mcs_margin_db: 0.0
+  min_mcs: 3
+  max_mcs: 24
+  min_code_rate: 0.2
+  scheme2_min_code_rate: 0.2
+  scheme2_allowed_qm: [2, 4, 6, 8]
+
+comparison:
+  enabled: true
+  schemes:
+    - scheme_id: 1
+    - scheme_id: 2
+    - scheme_id: 3
+    - scheme_id: 4
+    - scheme_id: 5
+    - scheme_id: 6
+    - scheme_id: 7
+
+debug:
+  verbose: true
+  save_per_snr_json: true
+  log_per_cw: true

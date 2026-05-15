@@ -1,0 +1,51 @@
+# 灵活码字映射链路级仿真平台 V1 基础配置
+
+antenna:
+  bs_n_antennas: 32
+  ue_n_antennas: 4
+
+resource:
+  n_prbs: 106
+  pdsch_n_symbols: 13
+  reserve_dmrs_re: false   # 第一版理想CE，不发DMRS，不扣除DMRS RE
+
+channel:
+  model: "Rayleigh"
+  normalize: true
+  n_re_samples: 24
+
+mapping:
+  scheme: "flexible_cw"
+  scheme_id: 1
+  rank: 4
+
+simulation:
+  backend: "link_abstraction"
+  snr_range_db: [0, 30, 5]
+  n_trials_per_snr: 1000
+  batch_size: 100
+  seed: 42
+  output_dir: "./results"
+
+  # 补充文档2覆盖后：默认使用 adaptive MCS
+  fixed_mcs: null
+  shannon_gap_db: 2.5
+
+  # Scheme 2 per-layer Qm 门限
+  qpsk_max_db: 5.0
+  qam16_max_db: 12.0
+  qam64_max_db: 18.0
+
+comparison:
+  enabled: true
+  schemes:
+    - {scheme_id: 1}
+    - {scheme_id: 2}
+    - {scheme_id: 3}
+    - {scheme_id: 4}
+    - {scheme_id: 5}
+    - {scheme_id: 6}
+    - {scheme_id: 7}
+
+debug:
+  verbose: true

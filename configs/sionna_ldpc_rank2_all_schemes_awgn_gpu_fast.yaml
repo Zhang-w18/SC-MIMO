@@ -1,0 +1,42 @@
+# v2.4 快速测试：rank=2 / 所有 Scheme / AWGN / fixed MCS / GPU batch
+antenna:
+  bs_n_antennas: 2
+  ue_n_antennas: 2
+resource:
+  n_prbs: 6
+  pdsch_n_symbols: 4
+  reserve_dmrs_re: false
+channel:
+  model: "AWGN"
+  n_re_samples: 1
+mapping:
+  scheme: "flexible_cw"
+  scheme_id: 1
+  rank: 2
+simulation:
+  backend: "sionna_ldpc_bit_level"
+  mcs_table: "nr_64qam"
+  fixed_mcs: 3
+  snr_range_db: [-6, 8, 2]
+  n_trials_per_snr: 3000
+  batch_size: 2048
+  seed: 7
+  output_dir: "./results_v24_rank2_all_schemes_awgn_fast"
+comparison:
+  enabled: true
+  schemes:
+    - {scheme_id: 1}
+    - {scheme_id: 2}
+    - {scheme_id: 3}
+    - {scheme_id: 4}
+    - {scheme_id: 5}
+    - {scheme_id: 6}
+    - {scheme_id: 7}
+receiver:
+  detector: "soft_demapper_ldpc"
+  sic_enabled: false
+  max_ldpc_iterations: 20
+debug:
+  verbose: true
+  save_per_snr_json: true
+  log_per_cw: true

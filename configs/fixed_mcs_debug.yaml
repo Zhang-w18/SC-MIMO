@@ -1,0 +1,19 @@
+# fixed MCS 仅用于 debug/ablation，不是第一版主流程
+mapping:
+  rank: 4
+
+simulation:
+  snr_range_db: [0, 20, 10]
+  n_trials_per_snr: 200
+  batch_size: 50
+  fixed_mcs: 10
+  output_dir: "./results_fixed_mcs_debug"
+
+comparison:
+  enabled: true
+  schemes:
+    - {scheme_id: 1}
+    - {scheme_id: 3}
+    - {scheme_id: 4}
+    - {scheme_id: 5}
+    - {scheme_id: 6}

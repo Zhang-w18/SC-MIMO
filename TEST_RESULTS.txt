@@ -1,0 +1,29 @@
+CB-level metrics update test notes
+==================================
+
+Manual core tests were executed in the container with direct test function calls because the default python process in this environment hangs at interpreter shutdown. The following test functions passed:
+
+- test_integer_partitions_rank4
+- test_mcs_selection_monotonic
+- test_scheme2_per_layer_qm
+- test_scheme_generation_rank4
+- test_symbol_mapping_count
+- test_tb_manager_closure
+
+The updated files are:
+- lls_platform/core/data_structures.py
+- lls_platform/sim/orchestrator.py
+- lls_platform/sim/stats.py
+- lls_platform/utils/plotting.py
+- CB_LEVEL_METRICS_UPDATE.md
+
+Expected new output columns in results.csv include:
+- scheme_cb_bler
+- cwX_cb_bler
+- cwX_n_cbs
+- cwX_cb_trials
+- cwX_cb_errors
+- cwX_successful_payload_bits
+- goodput_bits_per_slot
+- goodput_se_tf
+- goodput_se_layer_re

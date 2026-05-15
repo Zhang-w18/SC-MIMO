@@ -1,0 +1,126 @@
+antenna:
+  bs_n_antennas: 128
+  ue_n_antennas: 16
+  bs_antenna_array: [8, 8, 2]
+  ue_antenna_array: [4, 2, 2]
+  antenna_element_pattern: '38.901'
+  polarization: cross
+
+resource:
+  carrier_frequency_ghz: 7.0
+  scs_khz: 30
+  n_prbs: 6
+  pdsch_start_symbol: 1
+  pdsch_n_symbols: 4
+  reserve_dmrs_re: false
+
+channel:
+  model: CDL
+  cdl_type: A
+  delay_spread_ns: 300.0
+  ue_speed_kmh: 3.0
+  normalize: true
+  direction: downlink
+  num_time_samples: 4
+
+receiver:
+  detector: soft_demapper_ldpc
+  max_ldpc_iterations: 20
+
+# 理想接收机：对齐 v2.9 ideal SVD receiver 语义。
+# 不启用接收端信道估计误差；MCS 与 LDPC/LLR 等效解码都使用 ideal post-SINR。
+channel_estimation:
+  enabled: false
+  mode: ideal
+  error_model: nmse
+  nmse_db: -100.0
+  equalizer: mmse
+  use_actual_rx_post_sinr_for_decoding: false
+  apply_to_mcs_selection: false
+  seed_base: 93001
+
+mapping:
+  scheme: flexible_cw
+  rank: 4
+
+simulation:
+  snr_range_db: [0, 20, 4]
+  # OLLA 开启后，最终统计 trial 数由 olla.measure_trials_per_snr 控制；
+  # 这里保留 1000 作为非 OLLA 回退默认值。
+  n_trials_per_snr: 1000
+  # OLLA 第一版使用逐 trial offset 更新，因此建议 batch_size=1。
+  batch_size: 1
+  seed: 7
+  output_dir: ./results_v31_rank4_ideal_olla_cb10
+  fixed_mcs: null
+  mcs_table: nr_256qam
+  backend: sionna_ldpc_bit_level
+
+adaptive_mcs:
+  enabled: true
+  decision_granularity: per_trial
+  # v3.1 OLLA 仍然以 capacity_average 作为初始/基础 MCS selector，
+  # 然后通过 per-CW SINR offset 调整选择结果。
+  method: capacity_average
+  shannon_gap_db: 0.0
+  mcs_margin_db: 0.0
+  min_mcs: 3
+  max_mcs: 27
+  min_code_rate: 0.2
+  scheme2_min_code_rate: 0.2
+  scheme2_max_code_rate: 0.95
+  scheme2_allowed_qm: [2, 4, 6, 8]
+
+# v3.1 新增：per-CW OLLA。
+# offset 更新公式：offset_{t+1}=clip(offset_t + step_db*(target_cb_bler - e_t))，
+# 其中 e_t = 当前 trial 当前 CW 的失败 CB 数 / 当前 trial 当前 CW 的总 CB 数。
+olla:
+  enabled: true
+  target_metric: cb_bler
+  target_cb_bler: 0.10
+
+  # Default global OLLA update step, in dB.
+  # Offset update: offset_{t+1}=clip(offset_t + step*(target_cb_bler - e_t)).
+  step_db: 0.05
+
+  # Optional per-scheme step override.
+  # Matching order: exact scheme name > base scheme name > global step_db.
+  # Examples:
+  #   scheme7_partition_3+1: only this Scheme7 partition uses the given step.
+  #   scheme7: all Scheme7 partitions use the given step unless exact override exists.
+  # Scheme2 often reacts more slowly because it selects common rate + per-layer Qm,
+  # so it can use a larger step to leave the over-conservative region faster.
+  scheme_step_db:
+    scheme2: 0.10
+    # scheme1: 0.05
+    # scheme3: 0.05
+    # scheme7: 0.05
+
+  offset_init_db: 0.0
+  offset_min_db: -6.0
+  offset_max_db: 6.0
+  warmup_trials_per_snr: 300
+  measure_trials_per_snr: 1000
+  update_granularity: per_cw
+  update_rule: stochastic
+  reset_per_snr: true
+  freeze_after_warmup: false
+  force_sequential_updates: true
+  record_trace: true
+  ewma_beta: 0.02
+
+comparison:
+  enabled: true
+  schemes:
+    - scheme_id: 1
+    - scheme_id: 2
+    - scheme_id: 3
+    - scheme_id: 4
+    - scheme_id: 5
+    - scheme_id: 6
+    - scheme_id: 7
+
+debug:
+  verbose: true
+  save_per_snr_json: true
+  log_per_cw: true
