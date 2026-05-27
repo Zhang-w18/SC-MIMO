@@ -206,6 +206,8 @@ payload bits
   -> antenna-domain signal x_tx = V x_layer
 ```
 
+从概念上说，SC-MIMO mapping 应发生在 QAM modulation 之后：先把 coded bits 调制成 QAM symbols，再把这些 symbols 按 CB/part/layer/RE 放进 layer grid。当前 `sc_mimo_mapping.py` 的早期验证接口为了方便测试，输入仍然是 CB coded bits，并在函数内部调用 QAM mapper，直接输出 layer-domain symbol grid。因此它的代码接口看起来像 “bits -> grid”，但它覆盖的是 “modulation + SC-MIMO symbol placement” 这一段。
+
 ### 4.1 CB-aware mapping plan
 
 现有 `GridMappingPlan` 主要按 CW route 管理 bit indices。SC-MIMO 需要更细的 CB/part/resource 记录：
@@ -251,6 +253,25 @@ layer 1:    CBprev p1   CB0 part1   CB1 part1   CB2 part1
 
 - `termination=cyclic`：循环移位，无额外 guard，频谱效率不损失，但第一 CB 没有天然无干扰边界。
 - `termination=zero_guard`：起始位置为空或低功率 seed，有 decoding-wave 边界，但会带来资源开销。
+
+`cyclic` 的含义就是把某个 layer 或 layer group 上的 CB part 顺序循环移位。以 3 个 CB、rank2、`shift=1` 为例：
+
+```text
+CBs: CB0, CB1, CB2
+
+layer 0:  CB0 part0 | CB1 part0 | CB2 part0
+layer 1:  CB2 part1 | CB0 part1 | CB1 part1
+```
+
+这里 `CB2 part1` 被绕回到了 layer 1 的最前面，所以没有空洞、没有 guard，也没有额外资源开销。如果每个 CB 有 6 个 QAM symbols，并被平均拆成 3-symbol `part0` 和 3-symbol `part1`，则一维 RE index 上可以理解为：
+
+```text
+RE index:  0-2        3-5        6-8
+layer 0:   CB0 p0     CB1 p0     CB2 p0
+layer 1:   CB2 p1     CB0 p1     CB1 p1
+```
+
+这个结构的代价是：第一个 CB 没有天然无干扰边界。以 `CB0 part0` 为例，它所在的 RE 上，layer 1 同时有 `CB2 part1`，所以发射时不是单流，也不是空另一层；只有在接收端通过 SIC 消除对应干扰后，residual signal 中的某些 part 才会呈现低干扰或 rank2 下的 interference-free 观测。
 
 ### 4.3 rank>2 layer-group mapping
 
@@ -456,6 +477,202 @@ Qualcomm 文档给出了 `rML/rML+MMSE after SIC`，但没有规定 rML 的具�
 
 K-best rML 的调试标准应是：在 rank2/QPSK 或 rank2/16QAM 的小配置下，K 足够大时，它的 best candidate 和 LLR hard decision 与 `exhaustive_ml` 一致。
 
+#### 当前实现边界
+
+截至 2026-05-16，SC-MIMO 分支应按以下边界理解：
+
+- 发送端还没有完整实现 Qualcomm Table 2 的 “SRS-based SVD precoder, 40-slot update”。Phase 1/2 toy path 当前直接使用显式 `H_eff[RE, rx, layer]`，用于保留层间干扰并验证 mapping、detector、SIC。
+- 旧 Sionna backend 中已有 ideal SVD-equivalent / abstract RX-CE / MMSE post-SINR 计算，但那条路径本质上把 MIMO 简化成等效层信道，不是 SC-MIMO 所需的真实 soft MIMO detector。
+- Phase 2 的目标是先使用 perfect/genie `H_eff` 或显式给定 `H_hat_eff` 做 detector/SIC 正确性验证。Phase 3 再接入 proposal-like SRS SVD precoder aging 和 RMMSE/PRG-bundled channel estimation。
+- 当前已实现的 K-best 是普通 QAM MIMO 的 QR-domain list detector primitive，尚未接入 full-link rank4 1CW NR / SC-MIMO-SIC / 2CW 主仿真入口。
+- `rML+MMSE after SIC` 中的 MMSE receiver 尚未在 SC-MIMO true-MIMO path 中实现。已有的 MMSE 相关代码只可作为线性均衡和 post-SINR 计算参考。
+
+#### rML / K-best 接收机算法
+
+对每个 data RE，接收模型写成：
+
+```text
+y = H x + n
+n ~ CN(0, N0 I)
+H = H_eff            # perfect-CSI Phase 2
+H = H_hat_eff        # imperfect-CSI / proposal-like Phase 3
+x in A^L
+```
+
+其中 `L=rank`，`A` 是 QAM constellation。若显式建模预编码，则：
+
+```text
+H_eff[RE] = H_data[RE] V_precoder
+```
+
+Phase 3 对齐 Qualcomm 条件时，`V_precoder` 应来自 SRS-based SVD，并按 40-slot periodicity 更新；接收端 detector 使用 `H_hat_eff`，而不是直接使用不可获得的真实 `H_eff`。Phase 2 correctness 测试可以用 perfect `H_eff`，这样更容易定位 mapping 或 detector 错误。
+
+exhaustive ML reference 的 metric 为：
+
+```text
+D(x) = ||y - H x||^2 / N0
+
+LLR(b_t) ~= min_{x in A^L: b_t(x)=0} D(x)
+          - min_{x in A^L: b_t(x)=1} D(x)
+```
+
+K-best/rML 用 QR 分解近似上述搜索。对 `H` 做 reduced QR：
+
+```text
+H = Q R
+z = Q^H y
+```
+
+则：
+
+```text
+||y - Hx||^2 = ||z - R x||^2 + const
+```
+
+其中 `const = ||y||^2 - ||z||^2` 与候选 `x` 无关，不影响 LLR 的 hard decision；如果要和 exhaustive metric 数值逐项对齐，可以把它加回总 metric。
+
+K-best 从最后一层向第一层做上三角树搜索。对 partial path `x_i, x_{i+1}, ..., x_{L-1}`，递推 metric：
+
+```text
+D_i = D_{i+1}
+    + | z_i - R_{i,i} x_i - sum_{j=i+1}^{L-1} R_{i,j} x_j |^2 / N0
+
+D_L = 0
+```
+
+伪代码：
+
+```text
+function kbest_rml_detect(y, H, constellation A, bit_labels B, N0, K):
+    Q, R = qr(H)
+    z = Q^H y
+
+    paths = [{metric: 0, x: empty, bits: empty}]
+
+    for i = L-1 down to 0:
+        expanded = []
+        for path in paths:
+            for each symbol s in A:
+                x_new = path.x with x_i = s
+                bits_new = path.bits with bits_i = B(s)
+                residual_i = z_i - sum_{j=i}^{L-1} R_{i,j} x_new_j
+                metric_new = path.metric + |residual_i|^2 / N0
+                expanded.append({metric: metric_new, x: x_new, bits: bits_new})
+
+        paths = K entries in expanded with smallest metric
+
+    candidate_list = sort(paths by metric)
+
+    for each coded bit position t:
+        m0 = min metric in candidate_list where bit_t = 0
+        m1 = min metric in candidate_list where bit_t = 1
+        llr_t = m0 - m1
+
+    hard_bits = bits of candidate_list[0]
+    return hard_bits, llr, candidate_list
+```
+
+实现注意事项：
+
+- 当前 `lls_platform/phy/mimo_detection.py` 中的 `kbest_qam_mimo_detect()` 正是这个 QR-domain K-best 结构。
+- full-list 时，如果 `K >= M^L`，K-best 应与 exhaustive ML 的 best candidate 和 max-log LLR 一致。
+- finite-list 时，LLR 是 candidate-list 近似；如果某个 bit value 没有出现在 list 中，LLR 会饱和为很大正/负值，后续需要加入 LLR clipping。
+- 当前实现要求 `n_rx >= rank`，因为使用 reduced QR tree search。若后续研究 overloaded MIMO，需要另做 regularized QR 或其它 list detector。
+
+#### 是否复用 SLM 项目的 QR-list detector
+
+可以复用思想和部分框架，但不能直接把 SLM detector 当作 SC-MIMO 的 rML receiver。
+
+`/Users/zhangwei/Downloads/lls_platform_slm` 中已有 `qr_list_slm16qam_detect()`。它和 SC-MIMO 这里的 K-best 共同点是：
+
+- 都对 per-RE `H` 做 QR decomposition。
+- 都按 tree/list search 扩展 partial path。
+- 都用保留的 candidate list 生成 max-log LLR。
+- 都可用 exhaustive detector 做 golden reference。
+
+但 SLM detector 有专用结构：
+
+- 它处理 SLM Appendix-A 的 16QAM superposition/anchor mapping，不是普通 NR QAM symbol mapping。
+- 它每层扩展的是 local bits，经 anchor rule 生成 symbol；SC-MIMO/NR rML 每层扩展普通 QAM constellation `A`。
+- 它为配合 SLM ordered positions 反转了 channel columns；SC-MIMO rank4 默认应按实际 layer order 或后续选定的 sorted-QR/order rule 处理。
+- 它输出的是 SLM local-bit LLR；SC-MIMO 需要输出普通 coded-bit LLR，并通过 SC-MIMO CB/layer-group mapping plan scatter 回每个 CB。
+
+因此建议做法是：复用 SLM 项目的 QR metric、path pruning、candidate-list LLR、测试策略；不要直接复用 `qr_list_slm16qam_detect()` 的 anchor/symbol-expansion 逻辑。
+
+#### MMSE / rML+MMSE after SIC 计划
+
+MMSE receiver 的第一版目标不是替代 rML 主曲线，而是用于 `rML+MMSE after SIC` 和低复杂度消融。对某个 RE，设已解 CB 的贡献已经被消除：
+
+```text
+y_res = y - H_cancel x_hat_cancel
+```
+
+在 ideal-SIC sanity check 中，`H_cancel` 可以用真实 `H_eff`；在 realistic receiver 中，消除应使用 receiver 可获得的 `H_hat_eff`。对剩余未知层集合 `U`：
+
+```text
+y_res = H_U x_U + n + residual_error
+```
+
+线性 MMSE filter：
+
+```text
+W = (H_U^H H_U + (N0/Es) I)^(-1) H_U^H
+z = W y_res
+G = W H_U
+```
+
+其中 `Es` 是每层平均符号能量；若 QAM 已归一化且各层等功率，第一版可取 `Es=1` 或在 rank power normalization 后取对应层功率。
+
+对第 `l` 个未知层：
+
+```text
+z_l = G_{l,l} x_l + sum_{m != l} G_{l,m} x_m + w_l n
+```
+
+把其它层残余干扰近似成 Gaussian：
+
+```text
+sigma_l^2 = N0 ||w_l||^2 + Es * sum_{m != l} |G_{l,m}|^2
+```
+
+于是可用 scalar max-log demapper：
+
+```text
+LLR(b_{l,k}) ~= min_{s in A: b_k(s)=0} |z_l - G_{l,l} s|^2 / sigma_l^2
+              - min_{s in A: b_k(s)=1} |z_l - G_{l,l} s|^2 / sigma_l^2
+```
+
+伪代码：
+
+```text
+function mmse_soft_detect_after_sic(y, H_hat, known_symbols, known_mask, A, B, N0, Es):
+    y_res = y
+    for each known layer/resource contribution:
+        y_res = y_res - H_hat_known * x_known
+
+    U = layers still unknown on this RE
+    H_U = H_hat[:, U]
+
+    W = inv(H_U^H H_U + (N0/Es) I) H_U^H
+    z = W y_res
+    G = W H_U
+
+    for local layer index l in U:
+        sigma2_l = N0 * ||W_l||^2 + Es * sum_{m != l} |G_lm|^2
+        for each bit k of layer l:
+            m0 = min_{s in A with bit k = 0} |z_l - G_ll s|^2 / sigma2_l
+            m1 = min_{s in A with bit k = 1} |z_l - G_ll s|^2 / sigma2_l
+            llr_lk = m0 - m1
+
+    return llr for unknown layers
+```
+
+MMSE-after-SIC 在 SC-MIMO 中的预期作用：
+
+- 对已经因为 CB-level SIC 变成低干扰的 part，MMSE demapper 复杂度显著低于 rML。
+- 对仍强耦合的 part，仍优先使用 K-best/rML。
+- 第一版可实现 `receiver_mode = kbest_rml`、`receiver_mode = mmse_after_sic`、`receiver_mode = hybrid_rml_mmse_after_sic` 三种模式，并要求 NR baseline、SC-MIMO、2CW baseline 使用同等 CSI 质量和同等 detector 配置。
+
 ### 5.2 SIC 模式
 
 建议支持三种：
@@ -476,23 +693,41 @@ sic_mode: crc_gated  # 仅 CB decode 成功时消除，失败则不消除或做�
 DMRS channel estimation: RMMSE-based under PRG bundling size 4
 ```
 
-但开发顺序不应一开始就实现完整 RMMSE channel estimator。建议分三层推进：
+但开发顺序不应一开始就实现完整 RMMSE channel estimator。当前计划按两层推进：
 
 ```text
-Phase 1:
+Phase 2:
   perfect CSI / genie H_eff
   目的：验证 mapping、MIMO detector、SIC cancellation 机制是否正确。
 
-Phase 2:
-  abstract imperfect CSI
+Phase 3a:
+  abstract imperfect CSI / NMSE-controlled Gaussian estimation error
   目的：用可控 H_hat = H_eff + estimation_error 或 PRG-averaged H_hat 验证接收机对 CSI 误差的敏感度。
 
-Phase 3:
+Phase 3b:
   proposal-like RMMSE/PRG-bundled CE
   目的：对齐 Qualcomm Table 2 的 DMRS CE 条件。
 ```
 
 因此，回答是：为了验证 SC-MIMO 的基本机制，第一版不需要真实信道估计，使用 perfect `H_eff` 更合适；为了复现 Qualcomm 曲线，后续必须加入 realistic 或至少 proposal-like 的 `H_hat_eff`，并保证 NR baseline、SC-MIMO、2CW 使用同等 CSI 质量。
+
+当前 Phase 3a 的抽象误差模型：
+
+```text
+H_tx_hat[n] = H_true[n] + E_tx[n]
+H_rx_hat[n] = H_true[n] + E_rx[n]
+
+E_tx, E_rx ~ CN(0, sigma_e^2)
+sigma_e^2 = NMSE_linear * mean(|H_true|^2)
+
+V_tx[n] = right_singular_vectors(H_tx_hat[n])[:, 0:rank]
+H_eff_true[n] = H_true[n]  V_tx[n] / sqrt(rank)
+H_eff_rx[n]   = H_rx_hat[n] V_tx[n] / sqrt(rank)
+```
+
+TX 物理发送经过 `H_eff_true`；RX 的 rML/MMSE detector 和 SIC cancellation 使用 `H_eff_rx`。NMSE=0 时退化为 Phase 2 的 ideal SVD precoder + ideal RX CSI。
+
+内存上不能把一大批 full-grid `H_data` 和两份估计误差一起常驻。20 MHz / 15 kHz / 106 PRB / 13 symbols / 4Rx / 32Tx 的 `B=1` full-grid channel 已约 16.9 MB（complex64），batch 扩大后会迅速进入 GB 级。因此实现采用 streaming：每个 trial sample 一个 full grid，立即抽取 data RE，只在抽样后的 `H[RE,Rx,Tx]` 上加 NMSE 误差，然后只保留累计 BLER/goodput 统计。
 
 ## 6. 对齐 Qualcomm 仿真的 preset
 
@@ -575,135 +810,3 @@ mimo_receiver:
 - SIC: ideal / decoded / CRC-gated
 - termination: cyclic / zero guard / seeded low-rate CB
 - layer group size: 1/2/4
-
-## 8. 当前 SC-MIMO Python 工具说明
-
-当前仓库里已经有一组最小 SC-MIMO Python 工具。它们不是完整链路仿真，而是为了先把 SC-MIMO 的 mapping 语义、toy MIMO detector 和后续 SIC reconstruction 所需对象验证清楚。
-
-### 8.1 `sc_mimo_mapping.py`
-
-该模块对应本文档中的 **rank2 cyclic staggered CB mapping**。
-
-它实现的是：
-
-- `termination=cyclic`。
-- `rank=2`。
-- 每个 CB 按 QAM symbol stream 分成两个 part。
-- `part0` 映射到 layer 0，并按 CB 自然顺序排列。
-- `part1` 映射到 layer 1，并按 CB index 做 cyclic shift。
-- 每个 CB part 记录 `re_indices`、`bit_indices`、`symbol_indices`，用于后续收发两端按 CB/part 精确定位资源。
-
-在完整发射链路中的位置：
-
-```text
-payload bits
-  -> TB/CB segmentation
-  -> LDPC encode + rate matching
-  -> 每个 CB 得到 coded bits c_i[0:E_i]
-  -> sc_mimo_mapping.py:
-       CB coded bits -> rank2 SC-MIMO layer grid
-  -> precoder / true MIMO channel
-```
-
-其中 `map_rank2_cb_bits_to_layer_grid()` 是发射端参考 mapper：输入多个 CB 的 coded bits 和 mapping plan，输出 shape 为 `[n_re_per_layer, 2]` 的 layer-domain QAM symbol grid。
-
-在未来 SIC 接收链路中的位置：
-
-```text
-LDPC decoded CB bits 或 ideal true CB bits
-  -> re-encode / rate match / re-modulate
-  -> sc_mimo_mapping.py:
-       reconstruct one CB's layer-grid contribution
-  -> y_res = y_res - H_eff x_hat_i
-```
-
-其中 `reconstruct_rank2_cb_layer_grid()` 用来重构某一个 CB 在 layer grid 上的贡献。它返回的 grid 只有该 CB 占用的位置非零，其他位置为 0。这正是后续 SIC cancellation 前需要的 `x_hat_i`。
-
-该模块目前没有实现：
-
-- rank4 layer-group mapping。
-- `zero_guard` termination。
-- strict rectangular tile 的 rate-matching allocation。
-- 与 Sionna LDPC orchestrator 的 full-link 接入。
-- 真实 MIMO channel、MIMO detection、LDPC decode、SIC loop。
-
-### 8.2 `mimo_detection.py`
-
-该模块对应本文档中的 **`exhaustive_ml` reference detector**，不是 Qualcomm 复现阶段需要的 K-best/rML 主力 detector。
-
-它实现的是小规模 exhaustive max-log MIMO detection：
-
-```text
-输入:
-  y: 接收向量，shape [n_rx]
-  h: 有效 MIMO 信道，shape [n_rx, rank]
-  qm: 每个 QAM symbol 的 bit 数
-  noise_var: 噪声方差
-
-处理:
-  枚举所有 M^rank 个 QAM vector
-  计算 metric = ||y - Hx||^2 / noise_var
-  找到 best candidate bits
-  用 max-log 近似生成每个 bit 的 LLR
-
-输出:
-  best_bits
-  llr
-  candidate_metrics
-```
-
-在完整接收链路中的位置：
-
-```text
-received y[RE, rx] + H_eff[RE, rx, rank]
-  -> mimo_detection.py:
-       per-RE MIMO soft detection
-  -> scatter LLR 到 CB bit order
-  -> LDPC decode
-  -> SIC reconstruction / cancellation
-```
-
-当前用途：
-
-- rank2/QPSK 或低阶 QAM toy sanity check。
-- 验证 LLR 符号约定：本文档和当前 detector 使用 `LLR > 0` 硬判为 bit 1。
-- 给后续 K-best/rML detector 提供 correctness reference。
-
-当前限制：
-
-- 复杂度随 `rank * qm` 指数增长，因为候选数是 `2^(rank * qm)`，等价于 `M^rank`。
-- 不适合 rank4、高阶 QAM、大 batch 或 Qualcomm Table 2 曲线仿真。
-- 不包含 MMSE、K-best、sphere/list search，也不包含 channel estimation。
-
-### 8.3 `tests/test_sc_mimo_mapping.py`
-
-该文件是验证层，不是仿真链路的一部分。它用于确认当前最小数学工具没有偏离预期。
-
-它覆盖：
-
-- rank2 cyclic staggered CB mapping 的 layer 顺序和 CB 顺序。
-- 每个 CB 的 bit/symbol coverage 是否完整且不重复。
-- `E % Qm == 0` 的 CB symbol alignment 检查。
-- noiseless rank2 QPSK exhaustive MIMO detector 能否恢复发送 bits。
-- 单 CB reconstruction 是否满足：
-
-```text
-sum(reconstruct_rank2_cb_layer_grid(CB_i) for all CB_i)
-  == map_rank2_cb_bits_to_layer_grid(all CBs)
-```
-
-这三个 Python 文件不是完全独立的单文件脚本。它们依赖：
-
-- `numpy`。
-- `lls_platform/phy/numpy_qam.py` 中的 `qam_modulate()`。
-- 从项目根目录运行，使 Python 能导入 `lls_platform` 包。
-
-但它们不依赖：
-
-- Sionna。
-- TensorFlow。
-- CDL channel builder。
-- `run.py`。
-- 现有 Sionna LDPC orchestrator。
-
-因此，这组测试通过只说明当前最小工具正确，包括 rank2 cyclic mapping、symbol coverage、exhaustive detector 和 single-CB reconstruction。它不代表 full-link SC-MIMO 仿真已经实现，也不代表已经验证了 Qualcomm 提案中的最终性能收益。

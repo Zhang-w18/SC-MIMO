@@ -1,0 +1,33 @@
+# SC-MIMO Phase3a: abstract TX/RX CSI error, fixed-QPSK BLER sweep.
+# This reproduces the rank2 low-SNR n=10 streamed run:
+# results_phase3_csi_error_qpsk_bler_rank2_low_snr_n10_streamed/
+
+experiment:
+  name: sc_mimo_phase3_csi_error_rank2_low_snr_qpsk_bler
+  runner: tools/run_sc_mimo_phase3_csi_error.py
+
+sweep:
+  snr_db_values: [-24.0, -20.0, -16.0, -12.0]
+  ranks: [2]
+  speeds_kmh: [3.0, 30.0]
+  csi_error_cases:
+    - label: ideal_csi
+      tx_nmse_db: null
+      rx_nmse_db: null
+    - label: txrx_nmse_-15dB
+      tx_nmse_db: -15.0
+      rx_nmse_db: -15.0
+  n_trials_per_snr: 10
+  output_dir: results_phase3_csi_error_qpsk_bler_rank2_low_snr_n10_streamed
+  n_re_per_layer: 48
+  payload_k_per_cb: 24
+  num_iter: 20
+  seed: 20260520
+
+assumptions:
+  channel: CDL-A 30 ns
+  resource: 20 MHz, 15 kHz, 106 PRB, 13 PDSCH symbols
+  antenna: 32 TXRU / 4 RX
+  precoder: per-RE SVD on H_tx_hat
+  receiver: NR/2CW use K-best rML; SC-MIMO uses rML + MMSE after SIC
+  memory_policy: stream one full CDL grid per trial, sample data REs, add NMSE only on sampled H
