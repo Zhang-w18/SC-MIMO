@@ -26,7 +26,7 @@
 | Phase 1b：rank2 fixed-MCS with LDPC | `[DONE]` | 单 SNR NR-vs-SC-MIMO full-link smoke 已通过，包含 CB-aware TX branch、TBManager single/multi-CB 参数、LDPC、LLR scatter 和 CB-level SIC。 |
 | Phase 1c：rank2 fixed-MCS runnable experiment | `[DONE]` | 已实现固定 seed/SNR sweep 入口，可输出 NR vs SC-MIMO CSV/JSON 和 CB-BLER/goodput 曲线。 |
 | Phase 2：理想 CSI 下三方案对比 | `[IN_PROGRESS]` | 已完成 rank4 layer-group mapping、K-best/rML、rML+MMSE-after-SIC、CDL-A/20MHz/15kHz/3&30km/h/32Tx4Rx sampled ideal-SVD sweep；输出 NR 1CW、SC-MIMO-SIC、2CW baseline 图。 |
-| Phase 3：非理想 CSI 下对齐 Qualcomm Table 2 | `[IN_PROGRESS]` | 已新增抽象 NMSE 复高斯 CSI 误差 fixed-QPSK BLER sweep；SRS precoder aging、RMMSE/PRG-bundled DMRS CE、OLLA 10% TB-BLER 和完整 Table 2 复现仍待实现。 |
+| Phase 3：非理想 CSI 下对齐 Qualcomm Table 2 | `[IN_PROGRESS]` | 已新增抽象 NMSE 复高斯 CSI 误差 fixed-QPSK BLER sweep；新增 adaptive-MCS full-resource server sweep；SRS precoder aging、RMMSE/PRG-bundled DMRS CE、OLLA 10% TB-BLER 和完整 Table 2 复现仍待实现。 |
 | Phase 4：扩展研究 | `[TODO]` | 多维扫参和机制分析指标尚未实现。 |
 
 已完成的最小实现：
@@ -52,6 +52,124 @@
 - K-best/rML detector 尚未实现。
 - Qualcomm Table 2 preset 尚未落地。
 - NR basic mapping 已有 CW/layer 路由基础，但还需要在 SC-MIMO full-link toy simulation 中作为 NR baseline 接入真实 MIMO channel 和同等 rML detector。
+
+### 1.2 Phase 3b adaptive-MCS full-resource server experiment
+
+新增入口：
+
+```text
+tools/run_sc_mimo_phase3_adaptive_mcs.py
+configs/sc_mimo_phase3_adaptive_mcs_full_resource.yaml
+```
+
+该实验是在 Phase 3a `abstract CSI-error fixed-QPSK BLER` 的基础上改成自适应 MCS，并取消 data RE 抽样。资源固定为：
+
+```text
+20 MHz, 15 kHz SCS, 106 RB, 13 PDSCH symbols
+n_re_per_layer = 106 * 12 * 13 = 16536
+reserve_dmrs_re = false
+```
+
+也就是说，每层使用完整 `16536` 个 data RE，不再用 `n_re_per_layer=48` 的 sampled-RE smoke 设置。
+
+自适应 MCS 方法：
+
+1. 每个 trial 先生成 CDL-A full-grid channel，并按 TX 估计信道做 per-RE SVD precoding，得到 true effective channel 和 RX estimated effective channel。
+2. 对 RX estimated effective channel 计算 batched linear-MMSE 后处理 SINR：
+
+```text
+W[n] = (H_hat[n]^H H_hat[n] + N0 I)^(-1) H_hat[n]^H
+G[n] = W[n] H_hat[n]
+SINR_l[n] = |G_ll[n]|^2 / (sum_{j!=l}|G_lj[n]|^2 + N0 ||W_l[n]||^2)
+```
+
+3. 对所有 RE 和所有 layer 做平均 capacity 估计：
+
+```text
+SE_eff = mean_{n,l} log2(1 + 10^((SINR_l[n] - margin_db)/10) / gap_linear)
+```
+
+当前默认 `gap_db=2.5`、`margin_db=1.0`。
+
+4. 在 `nr_256qam` MCS 表中选择满足 `Qm * R <= SE_eff` 的最高 MCS，同时应用：
+
+```text
+min_mcs = 0
+max_mcs = 27
+min_code_rate = 0.2
+```
+
+5. 所选 MCS 决定本 trial 的 Qm、target code rate、TBS、CB 数和每个 CB 的 rate-matched length `E_i`。为了让 SC-MIMO CB-aware mapping 可重构，每个 `E_i` 做 QAM-symbol 对齐；rank4 默认要求每个 CB 的 QAM symbol 数是 4 的整数倍。
+
+CB 尺寸统计口径：
+
+```text
+cb_payload_bits_before_rm:
+  每个 CB 输入 LDPC encoder 的 payload/info bits。本实验的吞吐只统计成功解码的这部分真实信息比特。
+
+cb_rate_matched_bits_e:
+  每个 CB rate matching 后实际映射到 QAM/resource grid 的 coded-bit 长度 E。
+  E 不是吞吐；它包含编码冗余和 rate-matching 后为了填满资源发送的 coded bits。
+```
+
+因此 goodput/throughput 曲线使用 `sum(successful cb_payload_bits_before_rm) / trial`，不会把 `E_i` 当成真实信息比特。
+
+SC-MIMO 参数和 part 大小：
+
+```text
+rank4 默认 layer_groups = [[0,1], [2,3]]
+shift_pattern = [0,1]
+termination = cyclic
+strict rectangular tile = true
+
+CB_i 的 QAM symbol 数:
+  Nsym_i = E_i / Qm
+
+CB_i 在完整 rank grid 上的 tile row 数:
+  T_i = Nsym_i / rank
+
+CB_i 在 group g 上的 part 大小:
+  part_symbols_i,g = T_i * |group_g|
+  part_re_rows_i,g = T_i
+```
+
+例如 rank4 默认两个 group 都是 2 层，则每个 CB 有两个 part，每个 part 占 `T_i` 个 RE row、`2*T_i` 个 QAM symbols。`cb_schedule.csv` 会逐 CB 输出 `sc_mimo_tile_rows`、`sc_mimo_part_symbols_by_group` 和 `sc_mimo_part_re_rows_by_group`。
+
+当前三个方案使用同一个 trial-level MCS：
+
+```text
+nr_1cw
+sc_mimo_sic
+baseline_2cw
+```
+
+这样做的目的是先比较 mapping/receiver 机制，而不是引入每 CW CQI feedback 差异。后续如果要研究 2CW 独立 MCS，需要扩展 detector 和 layer-wise mixed-Qm mapping。
+
+输出新增：
+
+```text
+results.csv / results.json
+mcs_schedule.csv
+cb_schedule.csv
+cb_bler_vs_snr.png
+tb_bler_vs_snr.png
+goodput_se_vs_snr.png
+mcs_cdf.png
+cw_cb_count_hist.png
+cb_payload_bits_hist.png
+cb_rate_matched_bits_hist.png
+```
+
+服务器并行运行示例：
+
+```bash
+/home/zhangwei/anaconda3/envs/tf_sionna_rt/bin/python \
+  tools/run_sc_mimo_phase3_adaptive_mcs.py \
+  --config configs/sc_mimo_phase3_adaptive_mcs_full_resource.yaml \
+  --parallel-gpus 2,3,4,5,7
+```
+
+并行模式按 SNR 拆 worker，并给每个 worker 设置 `CUDA_VISIBLE_DEVICES=<gpu_id>`。所有 worker 完成后，主进程会聚合 `results.csv`、`results.json`、`mcs_schedule.csv` 并重画总的吞吐和 MCS CDF 曲线。
 
 ### 1.1 当前 SC-MIMO Python 工具说明
 

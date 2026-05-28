@@ -333,6 +333,8 @@ def detect_layer_grid(
         raise ValueError("y and h_eff receive dimensions do not match.")
 
     detector = str(detector).lower()
+    if detector in ("batch_mmse", "batched_mmse"):
+        return batched_mmse_detect_layer_grid(y_arr, h, qm=qm, noise_var=noise_var)
     if detector not in ("exhaustive", "kbest", "kbest_rml", "mmse"):
         raise ValueError("detector must be exhaustive, kbest, or mmse.")
     rank = int(h.shape[2])
@@ -354,6 +356,55 @@ def detect_layer_grid(
             res = mmse_qam_mimo_detect(y_arr[re], h[re], qm=qm, noise_var=noise_var)
         hard[re] = res.best_bits
         llr[re] = res.llr.reshape(rank, qm)
+    return GridDetectionResult(hard_bits=hard, llr=llr)
+
+
+def batched_mmse_detect_layer_grid(
+    y: np.ndarray,
+    h_eff: np.ndarray,
+    qm: int,
+    noise_var: float = 1e-9,
+) -> GridDetectionResult:
+    """Vectorized linear-MMSE soft detection for full-resource server sweeps."""
+
+    y_arr = np.asarray(y, dtype=np.complex128)
+    h = np.asarray(h_eff, dtype=np.complex128)
+    if y_arr.ndim != 2 or h.ndim != 3:
+        raise ValueError("Expected y [n_re,n_rx] and h_eff [n_re,n_rx,rank].")
+    if y_arr.shape[0] != h.shape[0] or y_arr.shape[1] != h.shape[1]:
+        raise ValueError("y and h_eff receive dimensions do not match.")
+
+    n_re = int(h.shape[0])
+    rank = int(h.shape[2])
+    qm = int(qm)
+    noise_var = max(float(noise_var), 1e-12)
+    bit_candidates, symbol_candidates = _qam_symbol_candidates(qm)
+
+    h_h = np.swapaxes(np.conj(h), 1, 2)  # [N,rank,n_rx]
+    gram = np.matmul(h_h, h)
+    reg = noise_var * np.eye(rank, dtype=np.complex128)[np.newaxis, :, :]
+    w = np.linalg.solve(gram + reg, h_h)
+    z = np.einsum("nlr,nr->nl", w, y_arr)
+    g = np.matmul(w, h)
+
+    hard = np.zeros((n_re, rank, qm), dtype=np.int8)
+    llr = np.zeros((n_re, rank, qm), dtype=np.float64)
+    for layer in range(rank):
+        g_ll = g[:, layer, layer]
+        total_gain = np.sum(np.abs(g[:, layer, :]) ** 2, axis=1)
+        interference = np.maximum(total_gain - np.abs(g_ll) ** 2, 0.0)
+        w_norm = np.sum(np.abs(w[:, layer, :]) ** 2, axis=1)
+        sigma2 = np.maximum(noise_var * w_norm + interference, 1e-12)
+        metrics = np.abs(z[:, layer, np.newaxis] - g_ll[:, np.newaxis] * symbol_candidates[np.newaxis, :]) ** 2
+        metrics = metrics / sigma2[:, np.newaxis]
+        best_idx = np.argmin(metrics, axis=1)
+        hard[:, layer, :] = bit_candidates[best_idx]
+        for bit_idx in range(qm):
+            bit_vals = bit_candidates[:, bit_idx]
+            m0 = np.min(metrics[:, bit_vals == 0], axis=1)
+            m1 = np.min(metrics[:, bit_vals == 1], axis=1)
+            llr[:, layer, bit_idx] = m0 - m1
+
     return GridDetectionResult(hard_bits=hard, llr=llr)
 
 
@@ -722,8 +773,16 @@ def exhaustive_detect_layer_grid_with_known_symbols(
     qm = int(qm)
     noise_var = max(float(noise_var), 1e-12)
     detector = str(detector).lower()
+    if detector in ("batch_mmse", "batched_mmse", "batch_mmse_after_sic", "batched_mmse_after_sic"):
+        return batched_mmse_detect_layer_grid_with_known_symbols(
+            y_arr,
+            h,
+            qm=qm,
+            known_mask=known,
+            noise_var=noise_var,
+        )
     if detector not in ("exhaustive", "kbest", "kbest_rml", "mmse", "hybrid_rml_mmse_after_sic"):
-        raise ValueError("detector must be exhaustive, kbest, mmse, or hybrid_rml_mmse_after_sic.")
+        raise ValueError("detector must be exhaustive, kbest, mmse, batch_mmse, or hybrid_rml_mmse_after_sic.")
     constellation_bits, constellation_symbols = _qam_symbol_candidates(qm)
     hard = np.zeros((h.shape[0], rank, qm), dtype=np.int8)
     llr = np.zeros((h.shape[0], rank, qm), dtype=np.float64)
@@ -785,6 +844,52 @@ def exhaustive_detect_layer_grid_with_known_symbols(
             for local_layer_idx, layer in enumerate(unknown_layers.tolist()):
                 hard[re, layer] = res.best_bits[local_layer_idx]
                 llr[re, layer] = res.llr.reshape(int(unknown_layers.size), qm)[local_layer_idx]
+
+    return GridDetectionResult(hard_bits=hard, llr=llr)
+
+
+def batched_mmse_detect_layer_grid_with_known_symbols(
+    y: np.ndarray,
+    h_eff: np.ndarray,
+    qm: int,
+    known_mask: np.ndarray,
+    noise_var: float = 1e-9,
+) -> GridDetectionResult:
+    """Vectorized MMSE detector for SIC residuals with known layers removed."""
+
+    y_arr = np.asarray(y, dtype=np.complex128)
+    h = np.asarray(h_eff, dtype=np.complex128)
+    known = np.asarray(known_mask, dtype=bool)
+    if y_arr.ndim != 2 or h.ndim != 3:
+        raise ValueError("Expected y [n_re,n_rx] and h_eff [n_re,n_rx,rank].")
+    if known.shape != (h.shape[0], h.shape[2]):
+        raise ValueError("known_mask must have shape [n_re,rank].")
+
+    n_re = int(h.shape[0])
+    rank = int(h.shape[2])
+    qm = int(qm)
+    hard = np.zeros((n_re, rank, qm), dtype=np.int8)
+    llr = np.zeros((n_re, rank, qm), dtype=np.float64)
+
+    patterns: Dict[tuple[int, ...], List[int]] = {}
+    for re in range(n_re):
+        unknown_layers = tuple(int(layer) for layer in range(rank) if not bool(known[re, layer]))
+        patterns.setdefault(unknown_layers, []).append(int(re))
+
+    for unknown_layers, re_indices in patterns.items():
+        if not unknown_layers:
+            continue
+        idx = np.asarray(re_indices, dtype=np.int64)
+        local_h = h[idx][:, :, list(unknown_layers)]
+        local = batched_mmse_detect_layer_grid(
+            y_arr[idx],
+            local_h,
+            qm=qm,
+            noise_var=noise_var,
+        )
+        for local_layer_idx, layer in enumerate(unknown_layers):
+            hard[idx, layer, :] = local.hard_bits[:, local_layer_idx, :]
+            llr[idx, layer, :] = local.llr[:, local_layer_idx, :]
 
     return GridDetectionResult(hard_bits=hard, llr=llr)
 
@@ -2086,6 +2191,13 @@ def run_phase3_csi_error_fixed_qpsk_bler_sweep(
     out_dir.mkdir(parents=True, exist_ok=True)
     summaries: List[SNRSummary] = []
     qm = 2
+    seed_rng = np.random.default_rng(int(seed))
+    trial_seed_by_index = {
+        (int(rank_value), int(snr_idx), int(trial_idx)): int(seed_rng.integers(0, 2**31 - 1))
+        for rank_value in ranks
+        for snr_idx in range(len(snr_values))
+        for trial_idx in range(n_trials)
+    }
 
     for rank in ranks:
         if rank not in (2, 4):
@@ -2121,13 +2233,7 @@ def run_phase3_csi_error_fixed_qpsk_bler_sweep(
                     channel_report: Dict[str, object] = {}
 
                     for trial_idx in range(n_trials):
-                        trial_seed = (
-                            int(seed)
-                            + rank * 10_000_000
-                            + int(speed * 10) * 100_000
-                            + snr_idx * 1_000
-                            + trial_idx
-                        )
+                        trial_seed = trial_seed_by_index[(int(rank), int(snr_idx), int(trial_idx))]
                         rng_payload = np.random.default_rng(trial_seed)
                         payload = [
                             rng_payload.integers(0, 2, size=int(payload_k_per_cb), dtype=np.int8)
@@ -2263,6 +2369,636 @@ def run_phase3_csi_error_fixed_qpsk_bler_sweep(
 
     save_csv(summaries, out_dir / "results.csv")
     save_json(summaries, out_dir / "results.json")
+    return CSIErrorComparisonSweepResult(output_dir=out_dir, summaries=summaries)
+
+
+def _split_integer_total(total: int, n_parts: int) -> List[int]:
+    total = int(total)
+    n_parts = int(n_parts)
+    if n_parts <= 0:
+        raise ValueError("n_parts must be positive.")
+    base = total // n_parts
+    rem = total % n_parts
+    return [base + (1 if i < rem else 0) for i in range(n_parts)]
+
+
+def _make_adaptive_cb_setup(
+    n_re_per_layer: int,
+    n_layers: int,
+    qm: int,
+    code_rate: float,
+    symbol_quantum: int = 1,
+) -> Dict[str, object]:
+    """Build full-resource LDPC CB sizes with symbol-aligned E values."""
+
+    from lls_platform.tx.tb_manager import choose_base_graph, quantize_tbs
+
+    n_re = int(n_re_per_layer)
+    n_layers = int(n_layers)
+    qm = int(qm)
+    symbol_quantum = max(int(symbol_quantum), 1)
+    if n_re <= 0 or n_layers <= 0 or qm <= 0:
+        raise ValueError("n_re_per_layer, n_layers, and qm must be positive.")
+
+    total_symbols = n_re * n_layers
+    total_bits = total_symbols * qm
+    tb_size = int(quantize_tbs(float(total_bits) * float(code_rate)))
+    bg, k_cb_max = choose_base_graph(tb_size, float(code_rate))
+    n_cbs = max(1, int(math.ceil(float(tb_size) / float(k_cb_max))))
+    if n_cbs % 2:
+        n_cbs += 1
+
+    if total_symbols < n_cbs * symbol_quantum:
+        raise ValueError("Resource is too small for symbol-aligned CB segmentation.")
+    if total_symbols % symbol_quantum != 0:
+        raise ValueError(
+            f"total_symbols={total_symbols} must be divisible by symbol_quantum={symbol_quantum}."
+        )
+
+    symbol_quanta = _split_integer_total(total_symbols // symbol_quantum, n_cbs)
+    cb_e_values = [int(q) * symbol_quantum * qm for q in symbol_quanta]
+    payload_lengths = _split_integer_total(tb_size, n_cbs)
+    return {
+        "tb_size": int(tb_size),
+        "n_cbs": int(n_cbs),
+        "payload_lengths": payload_lengths,
+        "cb_e_values": cb_e_values,
+        "actual_code_rate": float(tb_size) / float(total_bits),
+        "base_graph": int(bg),
+    }
+
+
+def _estimate_mmse_layer_sinr_db(h_eff: np.ndarray, noise_var: float) -> np.ndarray:
+    h = np.asarray(h_eff, dtype=np.complex128)
+    if h.ndim != 3:
+        raise ValueError("h_eff must have shape [n_re,n_rx,rank].")
+    n_re = int(h.shape[0])
+    rank = int(h.shape[2])
+    noise_var = max(float(noise_var), 1e-12)
+    h_h = np.swapaxes(np.conj(h), 1, 2)
+    gram = np.matmul(h_h, h)
+    reg = noise_var * np.eye(rank, dtype=np.complex128)[np.newaxis, :, :]
+    w = np.linalg.solve(gram + reg, h_h)
+    g = np.matmul(w, h)
+    out = np.zeros((n_re, rank), dtype=np.float64)
+    for layer in range(rank):
+        signal = np.abs(g[:, layer, layer]) ** 2
+        total_gain = np.sum(np.abs(g[:, layer, :]) ** 2, axis=1)
+        interference = np.maximum(total_gain - signal, 0.0)
+        w_norm = np.sum(np.abs(w[:, layer, :]) ** 2, axis=1)
+        denom = np.maximum(noise_var * w_norm + interference, 1e-12)
+        out[:, layer] = signal / denom
+    return 10.0 * np.log10(np.maximum(out, 1e-30))
+
+
+def _select_adaptive_mcs(
+    h_eff_for_selection: np.ndarray,
+    noise_var: float,
+    mcs_table: Sequence[object],
+    mcs_margin_db: float,
+    shannon_gap_db: float,
+    min_mcs: int,
+    max_mcs: int,
+    min_code_rate: float,
+) -> object:
+    sinr_db = _estimate_mmse_layer_sinr_db(h_eff_for_selection, noise_var)
+    sinr_linear = 10.0 ** ((sinr_db - float(mcs_margin_db)) / 10.0)
+    gap_linear = 10.0 ** (float(shannon_gap_db) / 10.0)
+    cw_se_eff = float(np.mean(np.log2(1.0 + sinr_linear / gap_linear)))
+    candidates = [
+        m for m in mcs_table
+        if int(min_mcs) <= int(m.index) <= int(max_mcs)
+        and float(m.code_rate) >= float(min_code_rate) - 1e-12
+    ]
+    if not candidates:
+        raise ValueError("MCS table is empty after filtering.")
+    best = candidates[0]
+    for m in candidates:
+        if float(m.spectral_efficiency) <= cw_se_eff + 1e-12:
+            best = m
+    return best
+
+
+def _make_payload_from_lengths(payload_lengths: Sequence[int], rng: np.random.Generator) -> List[np.ndarray]:
+    return [
+        rng.integers(0, 2, size=int(k), dtype=np.int8)
+        for k in payload_lengths
+    ]
+
+
+def _make_variable_single_cw_accumulator() -> Dict[str, float]:
+    return {
+        "trials": 0,
+        "scheme_errors": 0,
+        "cb_trials": 0,
+        "cb_errors": 0,
+        "goodput_sum": 0.0,
+        "tb_size_sum": 0.0,
+        "n_cbs_sum": 0.0,
+    }
+
+
+def _accumulate_variable_single_cw_trial(
+    acc: Dict[str, float],
+    result: Rank2LDPCTrialResult,
+    tb_size: int,
+    n_cbs: int,
+) -> None:
+    acc["trials"] += 1
+    acc["scheme_errors"] += 0 if result.tb_success else 1
+    acc["cb_trials"] += len(result.cb_success)
+    acc["cb_errors"] += sum(1 for ok in result.cb_success if not ok)
+    acc["goodput_sum"] += float(result.goodput_bits)
+    acc["tb_size_sum"] += float(tb_size)
+    acc["n_cbs_sum"] += float(n_cbs)
+
+
+def _variable_single_cw_summary(
+    scheme_label: str,
+    snr_db: float,
+    acc: Dict[str, float],
+    n_re_per_layer: int,
+    rank: int,
+    metadata: Dict[str, object],
+) -> SNRSummary:
+    trials = int(acc["trials"])
+    avg_tb = int(round(float(acc["tb_size_sum"]) / trials)) if trials else 0
+    avg_cbs = int(round(float(acc["n_cbs_sum"]) / trials)) if trials else 0
+    cw_stats = [CWSimulationStats(
+        cw_index=0,
+        trials=trials,
+        errors=int(acc["scheme_errors"]),
+        tb_size=avg_tb,
+        n_cbs=avg_cbs,
+        cb_trials=int(acc["cb_trials"]),
+        cb_errors=int(acc["cb_errors"]),
+        successful_payload_bits=float(acc["goodput_sum"]),
+    )]
+    return SNRSummary(
+        scheme_label=scheme_label,
+        snr_db=float(snr_db),
+        trials=trials,
+        scheme_errors=int(acc["scheme_errors"]),
+        cw_stats=cw_stats,
+        total_throughput_bits_per_slot=float(acc["goodput_sum"]) / trials if trials else 0.0,
+        metadata=dict(metadata),
+        n_re_per_layer=int(n_re_per_layer),
+        rank=int(rank),
+    )
+
+
+def _write_mcs_records_csv(records: Sequence[Dict[str, object]], path: str | Path) -> None:
+    import csv
+    path = Path(path)
+    if not records:
+        return
+    fieldnames = sorted(set().union(*(r.keys() for r in records)))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def _plot_mcs_cdf(records: Sequence[Dict[str, object]], path: str | Path) -> None:
+    from collections import defaultdict
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for row in records:
+        groups[str(row["scheme"])].append(int(row["mcs_index"]))
+
+    plt.figure()
+    for label, vals in sorted(groups.items()):
+        xs = np.sort(np.asarray(vals, dtype=float))
+        if xs.size == 0:
+            continue
+        ys = np.arange(1, xs.size + 1, dtype=float) / float(xs.size)
+        plt.step(xs, ys, where="post", label=label)
+    plt.xlabel("Scheduled MCS index")
+    plt.ylabel("CDF")
+    plt.grid(True)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def _append_cb_records(
+    records: List[Dict[str, object]],
+    *,
+    scheme: str,
+    snr_db: float,
+    trial_idx: int,
+    rank: int,
+    csi_error_case: str,
+    mcs_index: int,
+    qm: int,
+    payload_lengths: Sequence[int],
+    cb_e_values: Sequence[int],
+    layer_groups: Sequence[Sequence[int]] | None,
+) -> None:
+    payload_lengths = [int(x) for x in payload_lengths]
+    cb_e_values = [int(x) for x in cb_e_values]
+    if len(payload_lengths) != len(cb_e_values):
+        raise ValueError("payload_lengths and cb_e_values must have the same length.")
+
+    if scheme == "baseline_2cw":
+        split = len(payload_lengths) // 2
+        cw_ranges = [(0, 0, split), (1, split, len(payload_lengths))]
+    else:
+        cw_ranges = [(0, 0, len(payload_lengths))]
+
+    rank = int(rank)
+    qm = int(qm)
+    group_sizes = [len(group) for group in layer_groups] if layer_groups else []
+    for cw_index, start, stop in cw_ranges:
+        n_cbs_this_cw = int(stop - start)
+        for local_cb_idx, global_cb_idx in enumerate(range(start, stop)):
+            e_bits = int(cb_e_values[global_cb_idx])
+            cb_symbols = int(e_bits // qm)
+            tile_rows = cb_symbols // rank if rank > 0 and cb_symbols % rank == 0 else -1
+            part_symbols = [int(tile_rows * size) if tile_rows >= 0 else -1 for size in group_sizes]
+            records.append({
+                "scheme": scheme,
+                "snr_db": float(snr_db),
+                "trial_idx": int(trial_idx),
+                "rank": int(rank),
+                "csi_error_case": str(csi_error_case),
+                "mcs_index": int(mcs_index),
+                "qm": int(qm),
+                "cw_index": int(cw_index),
+                "cw_n_cbs": int(n_cbs_this_cw),
+                "cb_index_in_cw": int(local_cb_idx),
+                "cb_index_global": int(global_cb_idx),
+                "cb_payload_bits_before_rm": int(payload_lengths[global_cb_idx]),
+                "cb_rate_matched_bits_e": int(e_bits),
+                "cb_qam_symbols": int(cb_symbols),
+                "sc_mimo_tile_rows": int(tile_rows),
+                "sc_mimo_part_symbols_by_group": str(part_symbols),
+                "sc_mimo_part_re_rows_by_group": str([int(tile_rows) for _ in group_sizes] if tile_rows >= 0 else []),
+            })
+
+
+def _plot_histogram_by_scheme(
+    records: Sequence[Dict[str, object]],
+    field: str,
+    path: str | Path,
+    xlabel: str,
+    unique_keys: Sequence[str] | None = None,
+) -> None:
+    from collections import defaultdict
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups: Dict[str, List[int]] = defaultdict(list)
+    seen = set()
+    for row in records:
+        scheme = str(row["scheme"])
+        if unique_keys:
+            key = tuple(row.get(k) for k in unique_keys)
+            if key in seen:
+                continue
+            seen.add(key)
+        groups[scheme].append(int(float(row[field])))
+
+    plt.figure()
+    for label, vals in sorted(groups.items()):
+        if not vals:
+            continue
+        xs = np.asarray(vals, dtype=float)
+        bins = min(max(len(set(vals)), 1), 40)
+        plt.hist(xs, bins=bins, alpha=0.45, label=label)
+    plt.xlabel(xlabel)
+    plt.ylabel("Count")
+    plt.grid(True)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def _plot_cb_histograms(records: Sequence[Dict[str, object]], out_dir: str | Path) -> None:
+    out = Path(out_dir)
+    if not records:
+        return
+    _plot_histogram_by_scheme(
+        records,
+        "cw_n_cbs",
+        out / "cw_cb_count_hist.png",
+        "CB count per codeword",
+        unique_keys=("scheme", "snr_db", "trial_idx", "csi_error_case", "cw_index"),
+    )
+    _plot_histogram_by_scheme(
+        records,
+        "cb_payload_bits_before_rm",
+        out / "cb_payload_bits_hist.png",
+        "CB payload bits before rate matching",
+    )
+    _plot_histogram_by_scheme(
+        records,
+        "cb_rate_matched_bits_e",
+        out / "cb_rate_matched_bits_hist.png",
+        "CB rate-matched coded bits E",
+    )
+
+
+def run_phase3_adaptive_mcs_full_resource_sweep(
+    snr_db_values: Sequence[float] = (-12.0, -8.0, -4.0, 0.0),
+    ranks: Sequence[int] = (4,),
+    csi_error_cases: Sequence[tuple[str, float | None, float | None]] | None = None,
+    n_trials_per_snr: int = 1000,
+    output_dir: str | Path = "results_phase3_adaptive_mcs_full_resource",
+    num_iter: int = 20,
+    seed: int = 20260528,
+    mcs_table_name: str = "nr_256qam",
+    min_mcs: int = 0,
+    max_mcs: int = 27,
+    min_code_rate: float = 0.2,
+    shannon_gap_db: float = 2.5,
+    mcs_margin_db: float = 1.0,
+    detector: str = "batch_mmse",
+    speed_kmh: float = 3.0,
+    carrier_frequency_ghz: float = 4.0,
+    snr_index_offset: int = 0,
+) -> CSIErrorComparisonSweepResult:
+    """Run full-resource adaptive-MCS BLER/goodput comparison."""
+
+    from lls_platform.core.config import ResourceConfig
+    from lls_platform.tx.tb_manager import compute_n_re_per_layer
+    from lls_platform.utils.mcs_tables import get_mcs_table
+    from lls_platform.utils.plotting import plot_bler, plot_throughput
+
+    snr_values = [float(x) for x in snr_db_values]
+    ranks = [int(x) for x in ranks]
+    n_trials = int(n_trials_per_snr)
+    if csi_error_cases is None:
+        csi_error_cases = (
+            ("ideal_csi", None, None),
+            ("txrx_nmse_-15dB", -15.0, -15.0),
+        )
+    if n_trials <= 0:
+        raise ValueError("n_trials_per_snr must be positive.")
+
+    resource = ResourceConfig(
+        carrier_frequency_ghz=float(carrier_frequency_ghz),
+        bandwidth_mhz=20.0,
+        scs_khz=15,
+        n_prbs=106,
+        pdsch_start_symbol=1,
+        pdsch_n_symbols=13,
+        reserve_dmrs_re=False,
+        prb_bundling_size=4,
+    )
+    n_re_per_layer = int(compute_n_re_per_layer(resource))
+    mcs_table = get_mcs_table(str(mcs_table_name))
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summaries: List[SNRSummary] = []
+    mcs_records: List[Dict[str, object]] = []
+    cb_records: List[Dict[str, object]] = []
+
+    seed_rng = np.random.default_rng(int(seed))
+    trial_seed_by_index = {
+        (int(rank_value), int(snr_idx), int(trial_idx)): int(seed_rng.integers(0, 2**31 - 1))
+        for rank_value in ranks
+        for snr_idx in range(int(snr_index_offset) + len(snr_values))
+        for trial_idx in range(n_trials)
+    }
+
+    for rank in ranks:
+        if rank not in (2, 4):
+            raise ValueError("run_phase3_adaptive_mcs_full_resource_sweep currently supports rank 2 and rank 4.")
+        sc_layer_groups, sc_shift_pattern = _sc_mimo_groups_for_rank(rank)
+        two_cw_groups = _two_cw_groups_for_rank(rank)
+        symbol_quantum = 4 if rank == 4 else 2
+
+        for case_label, tx_nmse_db, rx_nmse_db in csi_error_cases:
+            case_slug = (
+                str(case_label)
+                .replace("/", "_")
+                .replace(" ", "_")
+                .replace("+", "plus")
+                .replace("-", "m")
+            )
+            subset_dir = out_dir / f"rank{rank}" / case_slug
+            subset_dir.mkdir(parents=True, exist_ok=True)
+            subset_summaries: List[SNRSummary] = []
+            subset_mcs_records: List[Dict[str, object]] = []
+            subset_cb_records: List[Dict[str, object]] = []
+
+            for snr_idx, snr_db in enumerate(snr_values):
+                noise_var = _noise_var_from_snr_db(snr_db)
+                nr_acc = _make_variable_single_cw_accumulator()
+                sc_acc = _make_variable_single_cw_accumulator()
+                cw2_acc = _make_variable_single_cw_accumulator()
+                channel_report: Dict[str, object] = {}
+
+                for trial_idx in range(n_trials):
+                    global_snr_idx = int(snr_index_offset) + int(snr_idx)
+                    trial_seed = trial_seed_by_index[(int(rank), global_snr_idx, int(trial_idx))]
+                    h_eff_true, h_eff_rx, channel_report = sample_cdl_svd_effective_channels_with_csi_error(
+                        n_re_per_layer=n_re_per_layer,
+                        rank=rank,
+                        speed_kmh=float(speed_kmh),
+                        tx_nmse_db=tx_nmse_db,
+                        rx_nmse_db=rx_nmse_db,
+                        seed=trial_seed,
+                    )
+                    mcs = _select_adaptive_mcs(
+                        h_eff_for_selection=h_eff_rx,
+                        noise_var=noise_var,
+                        mcs_table=mcs_table,
+                        mcs_margin_db=mcs_margin_db,
+                        shannon_gap_db=shannon_gap_db,
+                        min_mcs=min_mcs,
+                        max_mcs=max_mcs,
+                        min_code_rate=min_code_rate,
+                    )
+                    qm = int(mcs.Qm)
+                    list_size = int(min(256, max(16, 2 ** min(rank * qm, 8))))
+                    setup = _make_adaptive_cb_setup(
+                        n_re_per_layer=n_re_per_layer,
+                        n_layers=rank,
+                        qm=qm,
+                        code_rate=float(mcs.code_rate),
+                        symbol_quantum=symbol_quantum,
+                    )
+                    rng_payload = np.random.default_rng(trial_seed)
+                    payload = _make_payload_from_lengths(setup["payload_lengths"], rng_payload)
+                    adapter = SionnaLDPCAdapter(
+                        [int(bits.size) for bits in payload],
+                        setup["cb_e_values"],
+                        num_iter=num_iter,
+                    )
+                    encoded = adapter.encode(payload)
+                    noise_seed = trial_seed + 777
+
+                    nr = _run_nr_branch_from_encoded_cbs(
+                        payload,
+                        encoded,
+                        adapter,
+                        qm=qm,
+                        n_re_per_layer=n_re_per_layer,
+                        h_eff=h_eff_true,
+                        h_det_eff=h_eff_rx,
+                        noise_var=noise_var,
+                        rng=np.random.default_rng(noise_seed),
+                        rank=rank,
+                        detector=detector,
+                        list_size=list_size,
+                    )
+                    _accumulate_variable_single_cw_trial(nr_acc, nr, int(setup["tb_size"]), int(setup["n_cbs"]))
+
+                    sc = _run_sc_mimo_branch_from_encoded_cbs(
+                        payload,
+                        encoded,
+                        adapter,
+                        qm=qm,
+                        n_re_per_layer=n_re_per_layer,
+                        h_eff=h_eff_true,
+                        h_det_eff=h_eff_rx,
+                        noise_var=noise_var,
+                        rng=np.random.default_rng(noise_seed),
+                        sic_mode="decoded_sic",
+                        layer_groups=sc_layer_groups,
+                        shift_pattern=sc_shift_pattern,
+                        detector=("batch_mmse_after_sic" if detector in ("batch_mmse", "batched_mmse") else detector),
+                        list_size=list_size,
+                    )
+                    _accumulate_variable_single_cw_trial(sc_acc, sc, int(setup["tb_size"]), int(setup["n_cbs"]))
+
+                    two_cw, _stats = _run_2cw_baseline_from_payload_cbs(
+                        payload,
+                        cb_e_values=setup["cb_e_values"],
+                        qm=qm,
+                        n_re_per_layer=n_re_per_layer,
+                        h_eff=h_eff_true,
+                        h_det_eff=h_eff_rx,
+                        noise_var=noise_var,
+                        rng=np.random.default_rng(noise_seed),
+                        detector=detector,
+                        list_size=list_size,
+                        num_iter=num_iter,
+                        layer_groups=two_cw_groups,
+                    )
+                    _accumulate_variable_single_cw_trial(cw2_acc, two_cw, int(setup["tb_size"]), int(setup["n_cbs"]))
+
+                    for scheme in ("nr_1cw", "sc_mimo_sic", "baseline_2cw"):
+                        row = {
+                            "scheme": scheme,
+                            "snr_db": float(snr_db),
+                            "trial_idx": int(trial_idx),
+                            "rank": int(rank),
+                            "csi_error_case": str(case_label),
+                            "mcs_index": int(mcs.index),
+                            "modulation": str(mcs.modulation),
+                            "qm": int(qm),
+                            "code_rate": float(mcs.code_rate),
+                            "tb_size": int(setup["tb_size"]),
+                            "n_cbs": int(setup["n_cbs"]),
+                            "n_re_per_layer": int(n_re_per_layer),
+                        }
+                        subset_mcs_records.append(row)
+                        mcs_records.append(row)
+                    for scheme, groups in (
+                        ("nr_1cw", None),
+                        ("sc_mimo_sic", sc_layer_groups),
+                        ("baseline_2cw", two_cw_groups),
+                    ):
+                        target_records = subset_cb_records
+                        _append_cb_records(
+                            target_records,
+                            scheme=scheme,
+                            snr_db=snr_db,
+                            trial_idx=trial_idx,
+                            rank=rank,
+                            csi_error_case=str(case_label),
+                            mcs_index=int(mcs.index),
+                            qm=qm,
+                            payload_lengths=setup["payload_lengths"],
+                            cb_e_values=setup["cb_e_values"],
+                            layer_groups=groups,
+                        )
+
+                base_meta = {
+                    "phase": "3b_adaptive_mcs_full_resource",
+                    "rank": int(rank),
+                    "channel": "CDL-A 30ns",
+                    "bandwidth_mhz": 20.0,
+                    "scs_khz": 15,
+                    "n_prbs": 106,
+                    "pdsch_n_symbols": 13,
+                    "n_re_per_layer": int(n_re_per_layer),
+                    "mcs_table": str(mcs_table_name),
+                    "adaptive_mcs": "mean_MMSE_postSINR_capacity_with_margin",
+                    "mcs_margin_db": float(mcs_margin_db),
+                    "shannon_gap_db": float(shannon_gap_db),
+                    "min_mcs": int(min_mcs),
+                    "max_mcs": int(max_mcs),
+                    "min_code_rate": float(min_code_rate),
+                    "detector": str(detector),
+                    "precoder": "per_re_svd_on_tx_estimated_channel",
+                    "receiver_csi": "rx_estimated_effective_channel",
+                    "csi_error_case": str(case_label),
+                    "tx_nmse_db": _nmse_label(tx_nmse_db),
+                    "rx_nmse_db": _nmse_label(rx_nmse_db),
+                    "baseline_1": f"nr_1cw_scheme1_rank{rank}",
+                    "baseline_2": f"baseline_2cw_scheme4_rank{rank}_layers_{two_cw_groups}",
+                    "sc_mimo_layer_groups": str(sc_layer_groups),
+                    "full_resource": True,
+                    "memory_policy": "stream full CDL grid per trial; use all 106 RB x 13 symbols as data REs",
+                    "full_grid_bytes_per_trial": int(channel_report.get("full_grid_bytes_per_trial", 0)),
+                    "retained_channel_bytes_per_trial": int(channel_report.get("retained_channel_bytes_per_trial", 0)),
+                }
+                subset_summaries.extend([
+                    _variable_single_cw_summary(
+                        "nr_1cw",
+                        snr_db,
+                        nr_acc,
+                        n_re_per_layer=n_re_per_layer,
+                        rank=rank,
+                        metadata={**base_meta, "mapping": "nr_1cw"},
+                    ),
+                    _variable_single_cw_summary(
+                        "sc_mimo_sic",
+                        snr_db,
+                        sc_acc,
+                        n_re_per_layer=n_re_per_layer,
+                        rank=rank,
+                        metadata={**base_meta, "mapping": "sc_mimo_sic"},
+                    ),
+                    _variable_single_cw_summary(
+                        "baseline_2cw",
+                        snr_db,
+                        cw2_acc,
+                        n_re_per_layer=n_re_per_layer,
+                        rank=rank,
+                        metadata={**base_meta, "mapping": "baseline_2cw_scheme4"},
+                    ),
+                ])
+
+            save_csv(subset_summaries, subset_dir / "results.csv")
+            save_json(subset_summaries, subset_dir / "results.json")
+            _write_mcs_records_csv(subset_mcs_records, subset_dir / "mcs_schedule.csv")
+            _write_mcs_records_csv(subset_cb_records, subset_dir / "cb_schedule.csv")
+            plot_bler(subset_summaries, subset_dir / "cb_bler_vs_snr.png")
+            _plot_scheme_bler(subset_summaries, subset_dir / "tb_bler_vs_snr.png")
+            plot_throughput(subset_summaries, subset_dir / "goodput_se_vs_snr.png")
+            _plot_mcs_cdf(subset_mcs_records, subset_dir / "mcs_cdf.png")
+            _plot_cb_histograms(subset_cb_records, subset_dir)
+            summaries.extend(subset_summaries)
+            cb_records.extend(subset_cb_records)
+
+    save_csv(summaries, out_dir / "results.csv")
+    save_json(summaries, out_dir / "results.json")
+    _write_mcs_records_csv(mcs_records, out_dir / "mcs_schedule.csv")
+    _write_mcs_records_csv(cb_records, out_dir / "cb_schedule.csv")
+    plot_throughput(summaries, out_dir / "goodput_se_vs_snr.png")
+    _plot_mcs_cdf(mcs_records, out_dir / "mcs_cdf.png")
+    _plot_cb_histograms(cb_records, out_dir)
     return CSIErrorComparisonSweepResult(output_dir=out_dir, summaries=summaries)
 
 

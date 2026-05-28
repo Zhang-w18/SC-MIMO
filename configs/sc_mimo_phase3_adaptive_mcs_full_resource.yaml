@@ -1,0 +1,68 @@
+# SC-MIMO Phase3b: abstract TX/RX CSI error, adaptive-MCS, full-resource BLER/goodput sweep.
+#
+# Server command examples:
+#   /home/zhangwei/anaconda3/envs/tf_sionna_rt/bin/python tools/run_sc_mimo_phase3_adaptive_mcs.py \
+#     --config configs/sc_mimo_phase3_adaptive_mcs_full_resource.yaml --dry-run
+#
+#   /home/zhangwei/anaconda3/envs/tf_sionna_rt/bin/python tools/run_sc_mimo_phase3_adaptive_mcs.py \
+#     --config configs/sc_mimo_phase3_adaptive_mcs_full_resource.yaml --parallel-gpus 2,3,4,5,7
+
+experiment:
+  name: sc_mimo_phase3_adaptive_mcs_full_resource
+  runner: tools/run_sc_mimo_phase3_adaptive_mcs.py
+
+sweep:
+  snr_db_values: [-12.0, -8.0, -4.0, 0.0, 4.0, 8.0, 12.0, 16.0, 20.0]
+  ranks: [4]
+  csi_error_cases:
+    - label: ideal_csi
+      tx_nmse_db: null
+      rx_nmse_db: null
+    - label: txrx_nmse_-15dB
+      tx_nmse_db: -15.0
+      rx_nmse_db: -15.0
+
+  # Full-resource run: 106 RB * 12 subcarriers * 13 PDSCH symbols = 16536 RE/layer.
+  # Increase this on the server if tighter tails are needed.
+  n_trials_per_snr: 1000
+  output_dir: results_phase3_adaptive_mcs_full_resource
+
+  # Adaptive MCS settings.
+  mcs_table_name: nr_256qam
+  min_mcs: 0
+  max_mcs: 27
+  min_code_rate: 0.2
+  shannon_gap_db: 2.5
+  mcs_margin_db: 1.0
+
+  # Full-resource server mode uses batched MMSE soft detection.
+  detector: batch_mmse
+  num_iter: 20
+  seed: 20260528
+
+  # Fixed channel parameter for this experiment.
+  speed_kmh: 3.0
+  carrier_frequency_ghz: 4.0
+
+assumptions:
+  channel: CDL-A 30 ns
+  resource: 20 MHz, 15 kHz, 106 PRB, 13 PDSCH symbols, reserve_dmrs_re=false
+  antenna: 32 TXRU / 4 RX
+  precoder: per-RE SVD on H_tx_hat
+  receiver_csi: per-RE effective channel with optional additive NMSE error
+  receiver_detector: batched linear-MMSE soft detector
+  schemes:
+    - nr_1cw
+    - sc_mimo_sic
+    - baseline_2cw
+  outputs:
+    - results.csv / results.json
+    - mcs_schedule.csv
+    - cb_schedule.csv
+    - cb_bler_vs_snr.png
+    - tb_bler_vs_snr.png
+    - goodput_se_vs_snr.png
+    - mcs_cdf.png
+    - cw_cb_count_hist.png
+    - cb_payload_bits_hist.png
+    - cb_rate_matched_bits_hist.png
