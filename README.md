@@ -105,3 +105,11 @@ V2_6_CDL_ADAPTIVE_MCS_README.md
 ```bash
 python run.py --config configs/sionna_ldpc_rank2_all_schemes_cdl_adaptive.yaml
 ```
+
+## Phase 3b adaptive-MCS full-resource experiment
+
+服务器版 SC-MIMO Phase 3b 实验说明见：
+
+```text
+PHASE3_ADAPTIVE_MCS_FULL_RESOURCE_README.md
+```
