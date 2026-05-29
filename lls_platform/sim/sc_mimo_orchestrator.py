@@ -2414,10 +2414,29 @@ def _make_adaptive_cb_setup(
         raise ValueError(
             f"total_symbols={total_symbols} must be divisible by symbol_quantum={symbol_quantum}."
         )
+    if total_symbols % 2 != 0:
+        raise ValueError("Current 2CW baseline requires an even total symbol capacity.")
+    symbols_per_2cw_cw = total_symbols // 2
+    if symbols_per_2cw_cw % symbol_quantum != 0:
+        raise ValueError(
+            "Current 2CW baseline requires each half-CW symbol capacity to be "
+            f"divisible by symbol_quantum={symbol_quantum}."
+        )
 
-    symbol_quanta = _split_integer_total(total_symbols // symbol_quantum, n_cbs)
+    # Keep the first half of CBs exactly matched to CW0's layer-group
+    # capacity and the second half exactly matched to CW1. A flat split over
+    # all CBs can put remainder quanta into the first half and make the 2CW
+    # mapper see more coded bits than its two-layer grid can carry.
+    half_cbs = n_cbs // 2
+    symbol_quanta = (
+        _split_integer_total(symbols_per_2cw_cw // symbol_quantum, half_cbs)
+        + _split_integer_total(symbols_per_2cw_cw // symbol_quantum, half_cbs)
+    )
     cb_e_values = [int(q) * symbol_quantum * qm for q in symbol_quanta]
-    payload_lengths = _split_integer_total(tb_size, n_cbs)
+    payload_lengths = (
+        _split_integer_total(tb_size // 2, half_cbs)
+        + _split_integer_total(tb_size - tb_size // 2, half_cbs)
+    )
     return {
         "tb_size": int(tb_size),
         "n_cbs": int(n_cbs),

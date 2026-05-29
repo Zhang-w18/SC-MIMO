@@ -154,34 +154,39 @@ def _run_parallel(args: argparse.Namespace, kwargs: Dict[str, Any]) -> None:
     worker_root = root_out / "_workers"
     worker_root.mkdir(parents=True, exist_ok=True)
 
-    procs = []
     worker_dirs = []
-    for snr_idx, _snr in enumerate(snrs):
-        gpu = gpus[snr_idx % len(gpus)]
-        worker_out = worker_root / f"snr_{snr_idx}"
-        worker_dirs.append(worker_out)
-        cmd = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--config",
-            str(args.config),
-            "--snr-index",
-            str(snr_idx),
-            "--output-dir",
-            str(worker_out),
-        ]
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
-        print(f"[parallel] SNR index {snr_idx} -> GPU {gpu}, output {worker_out}")
-        procs.append(subprocess.Popen(cmd, env=env))
-
     failed = []
-    for snr_idx, proc in enumerate(procs):
-        rc = proc.wait()
-        if rc != 0:
-            failed.append((snr_idx, rc))
-    if failed:
-        raise RuntimeError(f"Worker failures: {failed}")
+    for batch_start in range(0, len(snrs), len(gpus)):
+        procs = []
+        batch = list(enumerate(snrs))[batch_start:batch_start + len(gpus)]
+        for local_idx, (snr_idx, _snr) in enumerate(batch):
+            gpu = gpus[local_idx]
+            worker_out = worker_root / f"snr_{snr_idx}"
+            worker_dirs.append(worker_out)
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--config",
+                str(args.config),
+                "--snr-index",
+                str(snr_idx),
+                "--output-dir",
+                str(worker_out),
+            ]
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = gpu
+            env.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+            env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+            print(f"[parallel] SNR index {snr_idx} -> GPU {gpu}, output {worker_out}")
+            procs.append((snr_idx, subprocess.Popen(cmd, env=env)))
+
+        for snr_idx, proc in procs:
+            rc = proc.wait()
+            if rc != 0:
+                failed.append((snr_idx, rc))
+        if failed:
+            raise RuntimeError(f"Worker failures: {failed}")
+
     _aggregate_worker_outputs(worker_dirs, root_out)
     print(f"\n并行仿真完成。聚合结果保存在: {root_out}")
 

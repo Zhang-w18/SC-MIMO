@@ -53,8 +53,10 @@ Recommended server command:
   --parallel-gpus 2,3,4,5,7
 ```
 
-`--parallel-gpus` launches one worker per SNR index and assigns workers round-robin
-to the listed GPU ids through `CUDA_VISIBLE_DEVICES`.
+`--parallel-gpus` launches at most one active worker per listed GPU. If there
+are more SNR points than GPUs, the runner executes them in batches and
+aggregates all worker outputs at the end. Each worker gets one visible GPU
+through `CUDA_VISIBLE_DEVICES`.
 
 The default output directory is:
 
